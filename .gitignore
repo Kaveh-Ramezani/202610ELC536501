@@ -1,6 +1,10 @@
 .venv
+.venv_311
 4/data_CIFAR10
 Project/heg_full_data
 5/data_MNIST
 5/data_FashionMNIST
 5/data_CIFAR10
+6/training_checkpoints
+*.pyc
+*.npz
