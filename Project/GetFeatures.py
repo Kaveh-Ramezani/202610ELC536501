@@ -25,7 +25,7 @@ X_Train = data['x_train']
 sample_features = X_Train[0, :, :120].flatten()
 # ---------------
 
-feature_string = ", ".join(map(str, sample_features))
+feature_string = ", ".join([f"{val:.6f}" for val in sample_features])
 
 output_filename = "ei_test_features_24000.txt"
 with open(output_filename, "w") as file:
