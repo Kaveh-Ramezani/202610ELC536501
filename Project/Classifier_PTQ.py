@@ -64,6 +64,7 @@ y_test = data['y_test']
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 X_TestTensor = torch.tensor(X_test_filtered, dtype=torch.float32).to(device)
+X_TestTensor = X_TestTensor.unsqueeze(3) # Ensure test data is also vertical
 y_TestTensor = torch.tensor(y_test, dtype=torch.long).to(device)
 ####################################################################################################
 # 1D-CNN Definition
@@ -72,26 +73,24 @@ class EdgeHEG_CNN(nn.Module):
     def __init__(self, num_channels, num_classes):
         super(EdgeHEG_CNN, self).__init__()
         
-        # Block 1: WIDE but SHALLOW (8 channels)
-        self.conv1 = nn.Conv1d(in_channels=num_channels, out_channels=8, kernel_size=15, stride=2, padding=7)
-        self.bn1 = nn.BatchNorm1d(8) # Reverted to BatchNorm to preserve amplitude!
-        self.pool1 = nn.MaxPool1d(kernel_size=2)
+        # Flipped from (1, 15) to (15, 1)
+        self.conv1 = nn.Conv2d(in_channels=num_channels, out_channels=8, kernel_size=(15, 1), stride=(2, 1), padding=(7, 0))
+        self.bn1 = nn.BatchNorm2d(8) 
+        self.pool1 = nn.MaxPool2d(kernel_size=(2, 1))
         
-        # Block 2: (16 channels)
-        self.conv2 = nn.Conv1d(in_channels=8, out_channels=16, kernel_size=5, stride=2, padding=2)
-        self.bn2 = nn.BatchNorm1d(16) 
-        self.pool2 = nn.MaxPool1d(kernel_size=2)
+        # Flipped from (1, 5) to (5, 1)
+        self.conv2 = nn.Conv2d(in_channels=8, out_channels=16, kernel_size=(5, 1), stride=(2, 1), padding=(2, 0))
+        self.bn2 = nn.BatchNorm2d(16) 
+        self.pool2 = nn.MaxPool2d(kernel_size=(2, 1))
         
         self.dropout = nn.Dropout(p=0.5) 
         self.flatten = nn.Flatten()
         
-        # 16 channels * 7 remaining time steps = 112 features
         self.fc = nn.Linear(16 * 7, num_classes)
           
     def forward(self, x):
         x = self.pool1(nnFunc.relu(self.bn1(self.conv1(x))))
         x = self.pool2(nnFunc.relu(self.bn2(self.conv2(x))))
-        
         x = self.dropout(x)
         x = self.flatten(x) 
         x = self.fc(x)
@@ -101,9 +100,9 @@ class EdgeHEG_CNN(nn.Module):
 ####################################################################################################
 class HEGDataset(Dataset):
   def __init__(self, X, y):
-    # Convert NumPy arrays to PyTorch Tensors
-    self.X = torch.tensor(X, dtype=torch.float32)
-    # Classification targets in PyTorch MUST be Long tensors
+    # Shape changes from (Trials, 4, 120) to (Trials, 4, 120, 1)
+    X_4D = np.expand_dims(X, axis=3) 
+    self.X = torch.tensor(X_4D, dtype=torch.float32)
     self.y = torch.tensor(y, dtype=torch.long) 
         
   def __len__(self):
@@ -209,17 +208,12 @@ for epoch in range(epochs):
     print_yellow(f"Epoch [{epoch+1}/{epochs}] | Loss: {epoch_loss:.4f} | Accuracy: {epoch_acc:.2f}%")
 
 print_green("\nTraining Complete!")
-
-# 3. SAVE THE MODEL FOR HARDWARE
-# Save the trained weights so they can be exported to C/C++ later
-torch.save(model.state_dict(), 'onnx/edge_heg_classifier_PTQ.pth')
-print_green("Model weights saved to 'edge_heg_classifier_PTQ.pth'")
 ####################################################################################################
 # Testing
 ####################################################################################################
 # 2. EVALUATING THE MODEL
 model.eval() # Tell PyTorch we are evaluating, not training
-with torch.no_grad(): # Save memory by turning off gradient tracking
+with torch.no_grad(): 
   test_outputs = model(X_TestTensor)
   _, test_predictions = torch.max(test_outputs, 1)
     
@@ -249,24 +243,25 @@ print(classification_report(y_true, y_pred, target_names=class_names))
 ####################################################################################################
 # Extracting The Model
 ####################################################################################################
-# Move the model off the GPU and onto the CPU, as your MCU doesn't have a GPU!
 model.cpu()
-# Lock the model into evaluation mode (turns off Dropout and gradients)
 model.eval()
-# Shape: (Batch=1, Channels=numChannels, TimeSteps=120)
-dummyMcuInput = torch.randn(1, numChannels, 120)
-onnxFilePath = "onnx/edgeHegClassifier_PTQ.onnx"
 
-print("Tracing the computation graph...")
+# STRICTLY 4D VERTICAL INPUT: (Batch=1, Channels=numChannels, Height=120, Width=1)
+dummyMcuInput = torch.randn(1, numChannels, 120, 1)
+
+os.makedirs("onnx", exist_ok=True)
+onnxFilePath = "onnx/edgeHeg_2D_Float32.onnx"
+
+print("Tracing the Vertical 2D computation graph...")
 torch.onnx.export(
-  model,                            # The trained PyTorch model
-  dummyMcuInput,                    # The fake data to trace the math
-  onnxFilePath,                     # The output filename
-  export_params=True,               # Save the trained weights, not just the architecture
-  opset_version=11,                 # Opset 11 is highly stable for Edge/Microcontroller conversion
-  do_constant_folding=True,         # Optimization: Pre-calculates constant math to save MCU clock cycles
-  input_names=['filteredADCData'],  # Naming the input array for your C-code
-  output_names=['Class'],           # Naming the output array for your C-code
+  model,                            
+  dummyMcuInput,                    
+  onnxFilePath,                     
+  export_params=True,               
+  opset_version=11,                 
+  do_constant_folding=True,         
+  input_names=['filteredADCData'],  
+  output_names=['Class'],           
 )
 ####################################################################################################
 # Accuracy After Degrading
@@ -330,6 +325,25 @@ def simulate_hardware_quantization(trained_model, bit_width, x_test, y_test):
     print(classification_report(y_true, y_pred, target_names=class_names))
     correct = (predicted == y_test).sum().item()
     acc = (correct / len(y_test)) * 100
+    # Move the model off the GPU and onto the CPU, as your MCU doesn't have a GPU!
+    quantized_model.cpu()
+    # Lock the model into evaluation mode (turns off Dropout and gradients)
+    quantized_model.eval()
+    # Shape: (Batch=1, Channels=numChannels, TimeSteps=120)
+    # dummyMcuInput = torch.randn(1, numChannels, 120)
+    # onnxFilePath = f"onnx/edgeHegClassifier_PTQ_INT{bit_width}.onnx"
+
+    # print("Tracing the computation graph...")
+    # torch.onnx.export(
+    #   quantized_model,                            # The trained PyTorch model
+    #   dummyMcuInput,                    # The fake data to trace the math
+    #   onnxFilePath,                     # The output filename
+    #   export_params=True,               # Save the trained weights, not just the architecture
+    #   opset_version=18,                 # Opset 11 is highly stable for Edge/Microcontroller conversion
+    #   do_constant_folding=True,         # Optimization: Pre-calculates constant math to save MCU clock cycles
+    #   input_names=['filteredADCData'],  # Naming the input array for your C-code
+    #   output_names=['Class'],           # Naming the output array for your C-code
+    #   )
       
   print(f"[{bit_width}-bit INT Simulation] Test Accuracy: {acc:.2f}%")
   return acc

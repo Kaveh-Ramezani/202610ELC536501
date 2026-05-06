@@ -315,24 +315,27 @@ print(classification_report(y_true, y_pred, target_names=class_names))
 ####################################################################################################
 # Extracting The Model
 ####################################################################################################
-import torch.onnx
-import onnx
-# Move the model off the GPU and onto the CPU, as your MCU doesn't have a GPU!
+# Move the model off the GPU and onto the CPU
 model.cpu()
-# Lock the model into evaluation mode (turns off Dropout and gradients)
+# Lock the model into evaluation mode (This triggers our 'else' block bypass!)
 model.eval()
+
 # Shape: (Batch=1, Channels=numChannels, TimeSteps=120)
 dummyMcuInput = torch.randn(1, numChannels, 120)
+
+# FORCE CREATE DIRECTORY IF MISSING
+os.makedirs("onnx", exist_ok=True)
 onnxFilePath = f"onnx/edgeHegClassifier_QAT_INT{HARDWARE_BIT_WIDTH}.onnx"
 
-print("Tracing the computation graph...")
+print_green("Tracing the computation graph...")
 torch.onnx.export(
-  model,                            # The trained PyTorch model
-  dummyMcuInput,                    # The fake data to trace the math
-  onnxFilePath,                     # The output filename
-  export_params=True,               # Save the trained weights, not just the architecture
-  opset_version=11,                 # Opset 11 is highly stable for Edge/Microcontroller conversion
-  do_constant_folding=True,         # Optimization: Pre-calculates constant math to save MCU clock cycles
-  input_names=['filteredADCData'],  # Naming the input array for your C-code
-  output_names=['Class'],           # Naming the output array for your C-code
+  model,                            
+  dummyMcuInput,                    
+  onnxFilePath,                     
+  export_params=True,               
+  opset_version=18,                 
+  do_constant_folding=True,         
+  input_names=['filteredADCData'],  
+  output_names=['Class'],           
 )
+print_green(f"ONNX Model successfully saved to {onnxFilePath}!")
