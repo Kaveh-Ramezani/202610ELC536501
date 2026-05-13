@@ -7,6 +7,7 @@ import mne
 import os
 import openneuro
 from Misc import *
+import sys
 
 # --- HARDWARE CHECK ---
 print(f"TensorFlow Version: {tf.__version__}")
@@ -91,7 +92,7 @@ for sub in trainSubjects:
                 raw.resample(10.0)
                 
                 if config['label'] in [0, 2]: 
-                    events = mne.make_fixed_length_events(raw, id=config['label'], duration=15.0)
+                    events = mne.make_fixed_length_events(raw, id=config['label'], duration=15.0, overlap=12.0)
                 else:
                     events, _ = mne.events_from_annotations(raw, verbose=False)
 
@@ -196,9 +197,19 @@ X_test_filtered = MCU_Filter_EMAHighpass(X_test_raw, shift_bits=8)
 print_yellow("Formatting arrays to NHWC for TensorFlow...")
 
 def format_for_tf(data_array):
-    # Expand dims to add "Width=1" -> Shape becomes (Trials, Channels, Time, 1)
-    data_4d = np.expand_dims(data_array, axis=3)
-    # Transpose to NHWC -> Shape becomes (Trials, Time, 1, Channels)
+    """
+    Standardizes each sample individually to remove subject-specific 
+    amplitude variations (Z-score: mean=0, std=1).
+    """
+    # 1. Z-Score Normalization per individual trial
+    means = np.mean(data_array, axis=2, keepdims=True)
+    stds = np.std(data_array, axis=2, keepdims=True)
+    stds[stds == 0] = 1.0 # Guard against division by zero
+    
+    norm_data = (data_array - means) / stds
+    
+    # 2. Expand and Transpose for TF (NHWC)
+    data_4d = np.expand_dims(norm_data, axis=3)
     return np.transpose(data_4d, (0, 2, 3, 1))
 
 X_Raw_TF = format_for_tf(X_Raw)

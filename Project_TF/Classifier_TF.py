@@ -3,6 +3,7 @@
 ####################################################################################################
 import tensorflow as tf
 from tensorflow.keras import layers, models
+from tensorflow.keras import regularizers
 import numpy as np
 import os
 import sys
@@ -57,60 +58,120 @@ class_names = ['Rest (0)', 'Squeeze (1)', 'Motion (2)']
 print_green("\n--- 2. Building Model ---")
 
 def build_edge_heg_tf(t_steps, channels, classes):
-    model = models.Sequential(name="EdgeHEG_CNN_TF")
-    
-    # DYNAMIC INPUT SHAPE APPLIED HERE
+    l2_reg = regularizers.l2(1e-3) # Standard weight decay
+
+    model = models.Sequential(name="EdgeHEG_Stable_Baseline")
     model.add(layers.InputLayer(shape=(t_steps, 1, channels)))
     
-    # Conv Block 1
+    # Conv Block 1: 16 filters to capture initial frequency components
     model.add(layers.ZeroPadding2D(padding=((7, 7), (0, 0)))) 
-    model.add(layers.Conv2D(filters=8, kernel_size=(15, 1), strides=(2, 1), padding='valid', kernel_initializer='he_uniform', name='conv1'))
-    model.add(layers.BatchNormalization(momentum=0.9, epsilon=1e-5, name='bn1')) 
-    model.add(layers.ReLU(name='relu1'))
-    model.add(layers.MaxPooling2D(pool_size=(2, 1), strides=(2, 1), name='pool1'))
+    model.add(layers.Conv2D(16, (15, 1), strides=(2, 1), padding='valid', 
+                            kernel_initializer='he_uniform', kernel_regularizer=l2_reg))
+    model.add(layers.BatchNormalization(momentum=0.9))
+    model.add(layers.ReLU())
+    model.add(layers.MaxPooling2D((2, 1)))
     
-    # Conv Block 2
+    # Conv Block 2: 32 filters for higher-level pattern recognition
     model.add(layers.ZeroPadding2D(padding=((2, 2), (0, 0))))
-    model.add(layers.Conv2D(filters=16, kernel_size=(5, 1), strides=(2, 1), padding='valid', kernel_initializer='he_uniform', name='conv2'))
-    model.add(layers.BatchNormalization(momentum=0.9, epsilon=1e-5, name='bn2'))
-    model.add(layers.ReLU(name='relu2'))
-    model.add(layers.MaxPooling2D(pool_size=(2, 1), strides=(2, 1), name='pool2'))
+    model.add(layers.Conv2D(32, (5, 1), strides=(2, 1), padding='valid', 
+                            kernel_initializer='he_uniform', kernel_regularizer=l2_reg))
+    model.add(layers.BatchNormalization(momentum=0.9))
+    model.add(layers.ReLU())
+    model.add(layers.MaxPooling2D((2, 1)))
     
-    # Classifier Head
-    model.add(layers.Dropout(rate=0.5, name='dropout'))
-    model.add(layers.Flatten(name='flatten'))
-    model.add(layers.Dense(units=classes, activation=None, kernel_initializer='he_uniform', name='fc'))
+    # Spatial Dropout + GAP: The standard "Armor" against overfitting
+    model.add(layers.SpatialDropout2D(rate=0.3))
+    model.add(layers.GlobalAveragePooling2D())
+    
+    # Dense Head
+    model.add(layers.Dropout(0.2)) 
+    model.add(layers.Dense(classes, kernel_initializer='he_uniform', 
+                           kernel_regularizer=l2_reg, name='fc_output'))
     
     return model
 
+# --- SECTION 4: CALLBACKS ---
+early_stop = tf.keras.callbacks.EarlyStopping(
+    monitor='val_loss', 
+    patience=10, 
+    restore_best_weights=True,
+    verbose=1
+)
 model = build_edge_heg_tf(time_steps, num_channels, num_classes)
 
 ####################################################################################################
 # 3. Compiling and Class Weights
 ####################################################################################################
+# Calculate inversely proportional class weights (Handles the raw data imbalance)
 class_counts = np.bincount(y_Raw)
 total_samples = len(y_Raw)
 weights = total_samples / (len(class_counts) * class_counts)
-class_weight_dict = {i: weight for i, weight in enumerate(weights)}
+custom_weights = {0: 2.0, 1: 1.0, 2: 1.2}
+# class_weight_dict = {i: weight for i, weight in enumerate(weights)}
+class_weight_dict = custom_weights
 
-loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-optimizer = tf.keras.optimizers.AdamW(learning_rate=0.001, weight_decay=1e-2)
-model.compile(optimizer=optimizer, loss=loss_fn, metrics=['accuracy'])
+
+print(f"\nComputed Class Weights: {class_weight_dict}")
+
+
+def sparse_focal_loss(gamma=2.0):
+    def loss(y_true, y_pred):
+        # 1. Calculate standard Cross-Entropy Loss
+        ce_loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred, from_logits=True)
+        
+        # 2. Convert raw model outputs (logits) to probabilities
+        probs = tf.nn.softmax(y_pred, axis=-1)
+        
+        # 3. Find the model's confidence in the CORRECT class
+        # FIX: Safely flatten y_true using reshape instead of squeeze
+        y_true_flat = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+        
+        # FIX: Extract depth safely for the one-hot encoder
+        depth = tf.cast(tf.shape(y_pred)[-1], tf.int32) 
+        y_true_onehot = tf.one_hot(y_true_flat, depth=depth) 
+        
+        pt = tf.reduce_sum(y_true_onehot * probs, axis=-1)
+        
+        # 4. Apply the Focal math: (1 - confidence)^gamma
+        focal_factor = tf.pow(1.0 - pt, gamma)
+        
+        # 5. Multiply the standard loss by the focal factor
+        return focal_factor * ce_loss
+    return loss
+
+# --- Compile the Model ---
+optimizer = tf.keras.optimizers.AdamW(learning_rate=0.0005, weight_decay=1e-2)
+
+model.compile(
+    optimizer=optimizer, 
+    loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True), 
+    metrics=['accuracy']
+)
 
 ####################################################################################################
 # 4. Training
 ####################################################################################################
-print_green("\n--- 4. Starting Training ---")
-EPOCH_NUMBER = 25
+print("\n--- 3. Starting Training ---")
+EPOCH_NUMBER = 50 # Increase epochs since the LR will slow down and fine-tune
 BATCH_SIZE = 32
 
+lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
+    monitor='val_loss', 
+    factor=0.5,       # Cut learning rate in half
+    patience= 4,      # If no improvement for 4 epochs
+    min_lr=1e-6,      # Don't go lower than this
+    verbose=1         # Print a message when it happens
+)
+
+# Add the callbacks=[...] to your fit function
 history = model.fit(
     x=X_Train_TF, y=y_Train_Augmented,
     batch_size=BATCH_SIZE, epochs=EPOCH_NUMBER,
     class_weight=class_weight_dict,
-    validation_data=(X_Test_TF, y_test), verbose=1
+    validation_data=(X_Test_TF, y_test), 
+    callbacks=[lr_scheduler, early_stop], # Include both
+    verbose=1
 )
-
 ####################################################################################################
 # 5. Evaluation & Float32 Confusion Matrix
 ####################################################################################################
@@ -139,7 +200,7 @@ print(classification_report(y_test, y_pred, target_names=class_names))
 ####################################################################################################
 print_green("\n--- 6. Exporting to TFLite ---")
 os.makedirs("tf_exports", exist_ok=True)
-model.save("tf_exports/edgeHeg_model.keras")
+model.save("tf_exports/edgeHeg_model_C.keras")
 
 # DYNAMIC MCU INPUT SHAPE APPLIED HERE
 mcu_input_shape = tf.TensorSpec(shape=[1, time_steps, 1, num_channels], dtype=tf.float32)
